@@ -1,10 +1,15 @@
-# bot.py
 import logging
 import json
+import os
 import asyncio
-import os # <-- استيراد مكتبة os
 from functools import partial
+from datetime import datetime
+from threading import Thread
 
+# --- مكتبة سيرفر الويب (عشان Render و UptimeRobot) ---
+from flask import Flask
+
+# --- مكتبات تيليجرام ---
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -14,19 +19,36 @@ from telegram.ext import (
     filters,
     ContextTypes,
 )
-from telegram.constants import ParseMode
+from telegram.constants import ParseMode, ChatAction
 
-# --- قراءة الإعدادات من متغيرات البيئة ---
-TOKEN = os.getenv("TELEGRAM_TOKEN")
-ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")
-CONTROLLER_ADMIN_ID = os.getenv("CONTROLLER_ADMIN_ID")
+# ==============================================================================
+# 0. سيرفر الويب (Keep Alive for Render/Replit)
+# ==============================================================================
+app = Flask('')
 
-# التحقق من وجود التوكن
-if not TOKEN:
-    raise ValueError("خطأ: لم يتم العثور على متغير TELEGRAM_TOKEN. تأكد من إضافته في Railway.")
+@app.route('/')
+def home():
+    return "Bot is running and alive! 🚀"
+
+def run_web_server():
+    # Render بيحتاج بورت، وغالباً بيستخدم Environment Variable اسمه PORT
+    # لو ملقاش، هيستخدم 8080 كافتراضي
+    port = int(os.environ.get('PORT', 8080))
+    app.run(host='0.0.0.0', port=port)
+
+def start_keep_alive():
+    t = Thread(target=run_web_server)
+    t.start()
+
+# ==============================================================================
+# 1. الإعدادات (CONFIGURATION)
+# ==============================================================================
+TOKEN = "8175662986:AAEWfKO69YNZ_jTXq5qBRWsROUVohuiNbtY"
+ADMIN_IDS_STR = "5324699237,5742283044,1207574750,6125721799,5933051169,5361987371,1388167296"
+CONTROLLER_ADMIN_ID = "1388167296"
 
 ADMIN_IDS = [admin_id.strip() for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip()]
-DATA_FILE = "bot_data.json" # Railway سيتعامل مع هذا الملف
+DATA_FILE = "bot_data.json"
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -34,161 +56,210 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# (باقي كود البوت بالكامل كما هو بدون أي تغيير...)
-# ...
-# ... (انسخ هنا باقي الدوال من الكود الأخير اللي بعتهولك)
-# ...
-
-# -----------------------------------------------------------------------------
-# 2. إدارة البيانات (Data Management)
-# -----------------------------------------------------------------------------
-
+# ==============================================================================
+# 2. إدارة البيانات (DATA MANAGER)
+# ==============================================================================
 def load_data():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
-            logger.info("تم تحميل البيانات بنجاح.")
             return json.load(f)
-    except FileNotFoundError:
-        logger.warning("ملف البيانات غير موجود، سيتم إنشاء ملف جديد.")
-        return {"students": {}}
-    except json.JSONDecodeError:
-        logger.error("خطأ في قراءة ملف البيانات، سيتم البدء ببيانات فارغة.")
-        return {"students": {}}
+    except (FileNotFoundError, json.JSONDecodeError):
+        return {"students": {}, "banned": []}
 
 def save_data(data):
     try:
         with open(DATA_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
-        logger.error(f"فشل حفظ البيانات: {e}")
+        logger.error(f"Error saving data: {e}")
 
-# -----------------------------------------------------------------------------
-# 3. وظائف البوت والمعالجات (Handlers)
-# -----------------------------------------------------------------------------
+# ==============================================================================
+# 3. وظائف الأدمن (ADMIN FEATURES)
+# ==============================================================================
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data='stats_btn')],
+        [InlineKeyboardButton("💾 نسخة احتياطية (Backup)", callback_data='backup_btn')],
+        [InlineKeyboardButton("📢 طريقة البث", callback_data='help_broadcast')],
+        [InlineKeyboardButton("🚫 كيفية الحظر", callback_data='help_ban')]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text("👮‍♂️ **لوحة تحكم الأدمن**", reply_markup=reply_markup, parse_mode=ParseMode.MARKDOWN)
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    user = update.effective_user
-    user_id = str(user.id)
-    if user_id not in data["students"]:
-        data["students"][user_id] = {"first_name": user.first_name, "username": user.username}
-        save_data(data)
-        logger.info(f"طالب جديد: {user.first_name} (ID: {user_id})")
-    await update.message.reply_text('أهلاً بك! يمكنك إرسال سؤالك الآن وسيتم تحويله إلى أحد المشرفين للرد عليك. لا تنس دعوة حلوة لإخوتك ღ')
+async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    try:
+        target_id = context.args[0]
+        if target_id not in data["banned"]:
+            data["banned"].append(target_id)
+            save_data(data)
+            await update.message.reply_text(f"⛔ تم حظر الطالب `{target_id}`.", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("هذا الطالب محظور بالفعل.")
+    except IndexError:
+        await update.message.reply_text("استخدم: `/ban ID`", parse_mode=ParseMode.MARKDOWN)
 
-async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    help_text = (
-        "🤖 *أوامر الأدمن المتاحة*\n\n"
-        "*/broadcast [رسالة]*\n"
-        " لإرسال رسالة جماعية. يمكنك أيضاً الرد على أي رسالة بهذا الأمر لبثها.\n\n"
-        "*/stats*\n"
-        " لعرض عدد الطلاب المسجلين.\n\n"
-        "*/done*\n"
-        " لإنهاء المحادثة الحالية مع طالب والعودة للوضع الطبيعي.\n\n"
-        "**للرد على الطلاب:**\n"
-        "اضغط على زر '🗣️ الرد على الطالب' للدخول في محادثة مباشرة معه."
-    )
-    await update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
+async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    try:
+        target_id = context.args[0]
+        if target_id in data["banned"]:
+            data["banned"].remove(target_id)
+            save_data(data)
+            await update.message.reply_text(f"✅ تم فك الحظر عن `{target_id}`.", parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text("هذا الطالب ليس محظوراً.")
+    except IndexError:
+        await update.message.reply_text("استخدم: `/unban ID`", parse_mode=ParseMode.MARKDOWN)
 
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    student_count = len(data.get("students", {}))
-    await update.message.reply_text(f"📊 يوجد حالياً *_`{student_count}`_* طالب مسجل في البوت.", parse_mode=ParseMode.MARKDOWN)
+async def send_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await update.message.reply_document(
+            document=open(DATA_FILE, 'rb'),
+            caption=f"💾 Backup: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("لا يوجد ملف بيانات.")
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    pass # أبقيت الكود السابق هنا لتجنب التكرار
+    if not update.message.reply_to_message and not context.args:
+        await update.message.reply_text("⚠️ للبث: رد على رسالة بـ `/broadcast` أو اكتب النص بعد الأمر.")
+        return
 
-async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """إنهاء وضع المحادثة مع الطالب."""
-    if 'reply_to_student_id' in context.user_data:
-        del context.user_data['reply_to_student_id']
-        await update.message.reply_text("✅ *تم الخروج من وضع المحادثة بنجاح.*", parse_mode=ParseMode.MARKDOWN)
-    else:
-        await update.message.reply_text("أنت لست في وضع محادثة حالياً.")
+    students = data.get("students", {}).keys()
+    if not students:
+        await update.message.reply_text("لا يوجد طلاب.")
+        return
 
+    status_msg = await update.message.reply_text(f"⏳ جاري البث لـ {len(students)} طالب...")
+    success = 0
+    
+    for student_id in students:
+        try:
+            if update.message.reply_to_message:
+                await update.message.reply_to_message.copy(chat_id=student_id)
+            else:
+                await context.bot.send_message(chat_id=student_id, text=' '.join(context.args))
+            success += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    
+    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=status_msg.message_id, text=f"✅ تم البث بنجاح لـ: {success}")
+
+# ==============================================================================
+# 4. معالجة الرسائل (CORE LOGIC)
+# ==============================================================================
 async def handle_student_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
     user = update.effective_user
     user_id = str(user.id)
-    if user_id not in data["students"]:
-        data["students"][user_id] = {"first_name": user.first_name, "username": user.username}
-        save_data(data)
-
-    await update.message.reply_text('تم استلام رسالتك، شكراً لك. سيتم الرد عليك قريباً.')
     
-    keyboard = [[InlineKeyboardButton("🗣️ الرد على الطالب", callback_data=f'reply_{user_id}')]]
+    if user_id in data.get("banned", []): return
+
+    if user_id not in data["students"]:
+        data["students"][user_id] = {"name": user.first_name, "username": user.username, "joined": str(datetime.now())}
+        save_data(data)
+        if CONTROLLER_ADMIN_ID:
+             await context.bot.send_message(chat_id=CONTROLLER_ADMIN_ID, text=f"➕ طالب جديد: {user.first_name} (`{user_id}`)", parse_mode=ParseMode.MARKDOWN)
+
+    await update.message.reply_text('تم الاستلام، سيتم الرد قريباً.. ⏳')
+
+    keyboard = [[InlineKeyboardButton(f"🗣️ رد على {user.first_name}", callback_data=f'reply_{user_id}')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
     for admin_id in ADMIN_IDS:
         try:
-            forwarded_message = await update.message.forward(chat_id=admin_id)
+            fwd = await update.message.forward(chat_id=admin_id)
             await context.bot.send_message(
-                chat_id=admin_id, 
-                text=f"سؤال جديد من *{user.first_name}* (ID: `{user_id}`)\nاضغط للرد 👇",
-                reply_to_message_id=forwarded_message.message_id,
+                chat_id=admin_id,
+                text=f"📩 من: *{user.first_name}* (`{user_id}`)\n@{user.username or 'NoUser'}",
+                reply_to_message_id=fwd.message_id,
                 reply_markup=reply_markup,
                 parse_mode=ParseMode.MARKDOWN
             )
-        except Exception as e:
-            logger.error(f"فشل إرسال الرسالة إلى الأدمن {admin_id}: {e}")
+        except Exception: pass
 
-async def handle_admin_reply(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    admin = update.effective_user
+async def handle_admin_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
     student_id = context.user_data.get('reply_to_student_id')
-    student_info = data.get("students", {}).get(student_id, {})
-    student_name = student_info.get("first_name", "طالب")
-    
+    if not student_id: return
+
     try:
+        await context.bot.send_chat_action(chat_id=student_id, action=ChatAction.TYPING)
+        await asyncio.sleep(0.5)
         await update.message.copy(chat_id=student_id)
-        if str(admin.id) != CONTROLLER_ADMIN_ID and CONTROLLER_ADMIN_ID:
-            notification_text = (f"📝 الأدمن *{admin.first_name}* يواصل الرد على *{student_name}*...")
-            await context.bot.send_message(chat_id=CONTROLLER_ADMIN_ID, text=notification_text, parse_mode=ParseMode.MARKDOWN)
+        await update.message.set_reaction("👍")
+
+        if str(update.effective_user.id) != CONTROLLER_ADMIN_ID and CONTROLLER_ADMIN_ID:
+            await context.bot.send_message(chat_id=CONTROLLER_ADMIN_ID, text=f"📝 رد من {update.effective_user.first_name} على `{student_id}`", parse_mode=ParseMode.MARKDOWN)
             await update.message.copy(chat_id=CONTROLLER_ADMIN_ID)
     except Exception as e:
-        logger.error(f"فشل إرسال الرد للطالب {student_id}: {e}")
-        await update.message.reply_text(f"حدث خطأ. قد يكون الطالب قد حظر البوت. للخروج، أرسل /done")
+        await update.message.reply_text(f"❌ فشل الإرسال: {e}")
 
-async def button_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+async def done_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if 'reply_to_student_id' in context.user_data:
+        del context.user_data['reply_to_student_id']
+        await update.message.reply_text("✅ تم إنهاء المحادثة.")
+    else:
+        await update.message.reply_text("لست في محادثة.")
+
+async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
     query = update.callback_query
     await query.answer()
-    action, student_id = query.data.split('_', 1)
-    if action == 'reply':
-        context.user_data['reply_to_student_id'] = student_id
-        student_name = data.get("students", {}).get(student_id, {}).get("first_name", "غير معروف")
-        reply_text = (
-            f"🗣️ *أنت الآن في محادثة مباشرة مع الطالب {student_name}*.\n\n"
-            "أي رسالة ترسلها الآن ستصل إليه مباشرة.\n\n"
-            "لإنهاء المحادثة، أرسل الأمر: /done"
-        )
-        await query.edit_message_text(text=reply_text, parse_mode=ParseMode.MARKDOWN)
+    action = query.data
 
-async def message_dispatcher(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    user = update.effective_user
-    user_id = str(user.id)
-    if user_id in ADMIN_IDS and context.user_data.get('reply_to_student_id'):
-        await handle_admin_reply(update, context, data)
-    elif user_id in ADMIN_IDS:
-        await update.message.reply_text("أهلاً بك أيها الأدمن. استخدم /help لعرض الأوامر.")
+    if action.startswith('reply_'):
+        student_id = action.split('_')[1]
+        context.user_data['reply_to_student_id'] = student_id
+        name = data["students"].get(student_id, {}).get("name", "الطالب")
+        await query.edit_message_text(f"🟢 محادثة مفتوحة مع **{name}**.\nللإغلاق: `/done`", parse_mode=ParseMode.MARKDOWN)
+    elif action == 'stats_btn':
+        await query.message.reply_text(f"👥 الطلاب: {len(data.get('students', {}))}\n🚫 المحظورين: {len(data.get('banned', []))}")
+    elif action == 'backup_btn':
+        await send_backup(query, context)
+    elif action == 'help_broadcast':
+        await query.message.reply_text("📢 للبث: `/broadcast النص` أو رد على رسالة بـ `/broadcast`", parse_mode=ParseMode.MARKDOWN)
+    elif action == 'help_ban':
+        await query.message.reply_text("🚫 `/ban ID` للحظر\n`/unban ID` لفك الحظر", parse_mode=ParseMode.MARKDOWN)
+
+async def main_router(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    if str(update.effective_user.id) in ADMIN_IDS:
+        if context.user_data.get('reply_to_student_id'):
+            if update.message.text and update.message.text.startswith('/'): return 
+            await handle_admin_reply_mode(update, context, data)
+        else:
+            if not update.message.text or not update.message.text.startswith('/'):
+                await update.message.reply_text("أهلاً أدمن 👋. /admin للتحكم.")
     else:
         await handle_student_message(update, context, data)
 
+# ==============================================================================
+# 5. التشغيل (MAIN)
+# ==============================================================================
 def main():
+    # تشغيل سيرفر الويب في الخلفية (مهم لـ Render)
+    start_keep_alive()
+
     bot_data = load_data()
-    builder = Application.builder().token(TOKEN)
-    app = builder.build()
+    app = Application.builder().token(TOKEN).build()
     
     p = partial
-    start_p, stats_p, broadcast_p, button_p, dispatcher_p = p(start_command, data=bot_data), p(stats_command, data=bot_data), p(broadcast_command, data=bot_data), p(button_callback_handler, data=bot_data), p(message_dispatcher, data=bot_data)
+    router_p = p(main_router, data=bot_data)
+    btns_p = p(buttons_handler, data=bot_data)
+    ban_p = p(ban_user_command, data=bot_data)
+    unban_p = p(unban_user_command, data=bot_data)
+    broad_p = p(broadcast_command, data=bot_data)
+
+    admin_only = filters.User(user_id=[int(uid) for uid in ADMIN_IDS])
+
+    app.add_handler(CommandHandler("start", partial(start_command, data=bot_data)))
+    app.add_handler(CommandHandler("admin", admin_panel, filters=admin_only))
+    app.add_handler(CommandHandler("done", done_command, filters=admin_only))
+    app.add_handler(CommandHandler("ban", ban_p, filters=admin_only))
+    app.add_handler(CommandHandler("unban", unban_p, filters=admin_only))
+    app.add_handler(CommandHandler("broadcast", broad_p, filters=admin_only))
     
-    admin_filter = filters.User(user_id=[int(uid) for uid in ADMIN_IDS])
-    media_filter = (filters.ALL) & ~filters.COMMAND
+    app.add_handler(CallbackQueryHandler(btns_p))
+    app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, router_p))
 
-    app.add_handler(CommandHandler('start', start_p))
-    app.add_handler(CommandHandler('help', help_command, filters=admin_filter))
-    app.add_handler(CommandHandler('stats', stats_p, filters=admin_filter))
-    app.add_handler(CommandHandler('broadcast', broadcast_p, filters=admin_filter))
-    app.add_handler(CommandHandler('done', done_command, filters=admin_filter))
-    app.add_handler(CallbackQueryHandler(button_p))
-    app.add_handler(MessageHandler(media_filter, dispatcher_p))
-
-    logger.info("البوت بدأ التشغيل...")
+    print("Bot is Running on Render/Replit Mode...")
     app.run_polling()
 
 if __name__ == '__main__':
