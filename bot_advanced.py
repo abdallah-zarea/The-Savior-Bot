@@ -3,9 +3,10 @@ import json
 import os
 import asyncio
 from functools import partial
+from datetime import datetime
 from threading import Thread
 
-# --- Flask Server (عشان Render يفضل شغال) ---
+# --- Flask Server for Render ---
 from flask import Flask
 
 # --- Telegram Libraries ---
@@ -27,7 +28,7 @@ app = Flask('')
 
 @app.route('/')
 def home():
-    return "Simple & Pro Bot is Alive! 🚀"
+    return "Legendary Bot is Alive! 🛡️"
 
 def run_web_server():
     port = int(os.environ.get('PORT', 10000))
@@ -38,7 +39,7 @@ def start_keep_alive():
     t.start()
 
 # ==============================================================================
-# 1. CONFIGURATION (الإعدادات)
+# 1. CONFIGURATION
 # ==============================================================================
 TOKEN = "8175662986:AAEWfKO69YNZ_jTXq5qBRWsROUVohuiNbtY"
 ADMIN_IDS_STR = "5324699237,5742283044,1207574750,6125721799,5933051169,5361987371,1388167296"
@@ -47,27 +48,22 @@ CONTROLLER_ADMIN_ID = "1388167296"
 ADMIN_IDS = [admin_id.strip() for admin_id in ADMIN_IDS_STR.split(',') if admin_id.strip()]
 DATA_FILE = "bot_data.json"
 
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 2. DATA MANAGEMENT (إدارة البيانات)
+# 2. DATA MANAGEMENT
 # ==============================================================================
-# active_chats: لتخزين المحادثات المطولة المفتوحة حالياً في الذاكرة
-# Format: {admin_id: student_id}
-ACTIVE_CHATS = {} 
+# Global variable to track locked chats in memory (RAM)
+# Format: {'student_id': {'admin_id': '123', 'admin_name': 'Ahmed'}}
+LOCKED_CHATS = {} 
 
 def load_data():
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             return json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        # students: بيانات الطلاب
-        # msg_map: ربط رسالة الأدمن برسالة الطالب (عشان الرد العادي)
-        return {"students": {}, "msg_map": {}}
+        return {"students": {}, "banned": []}
 
 def save_data(data):
     try:
@@ -77,221 +73,386 @@ def save_data(data):
         logger.error(f"Error saving data: {e}")
 
 # ==============================================================================
-# 3. CORE LOGIC (المنطق الأساسي)
+# 3. ADMIN TOOLS & PANEL
 # ==============================================================================
 
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """أمر البداية للطالب"""
-    user = update.effective_user
-    user_id = str(user.id)
-    
-    # تسجيل الطالب
-    if user_id not in data["students"]:
-        data["students"][user_id] = {
-            "name": user.first_name, 
-            "username": user.username
-        }
-        save_data(data)
+async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("📊 الإحصائيات", callback_data='stats_btn')],
+        [InlineKeyboardButton("🔓 فك قفل جميع المحادثات (طوارئ)", callback_data='force_unlock_all')],
+        [InlineKeyboardButton("📢 البث", callback_data='help_broadcast'), InlineKeyboardButton("🚫 الحظر", callback_data='help_ban')]
+    ]
+    await update.message.reply_text("👮‍♂️ **لوحة القيادة المركزية**", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode=ParseMode.MARKDOWN)
 
-    await update.message.reply_text(
-        "👋 **أهلاً بك!**\n\n"
-        "أرسل سؤالك أو رسالتك الآن، وسيقوم المشرفون بالرد عليك.\n"
-        "لا تنسَ الدعاء لإخوانك. 🤍",
-        parse_mode=ParseMode.MARKDOWN
-    )
-
-async def handle_student_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """استقبال رسالة الطالب وتوجيهها للأدمن"""
-    user = update.effective_user
-    user_id = str(user.id)
-    
-    # تحديث البيانات
-    if user_id not in data["students"]:
-        data["students"][user_id] = {"name": user.first_name, "username": user.username}
-    
-    # إشعار للطالب
-    await update.message.reply_text("✅ تم الإرسال، انتظر الرد.", quote=True)
-
-    # تجهيز زر المحادثة المطولة
-    keyboard = [[InlineKeyboardButton("🗣️ فتح محادثة مطولة", callback_data=f'chat_{user_id}')]]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-
-    # التوجيه لكل الأدمنز
-    for admin_id in ADMIN_IDS:
-        try:
-            # توجيه الرسالة (Forward)
-            forwarded_msg = await update.message.forward(chat_id=admin_id)
-            
-            # إرسال زر التحكم تحتها
-            sent_msg = await context.bot.send_message(
-                chat_id=admin_id,
-                text=f"👆 رسالة من الطالب: {user.first_name} (`{user_id}`)\nلـ *الرد السريع*: اعمل Reply على الرسالة اللي فوق.\nلـ *النقاش*: اضغط الزر تحت.",
-                reply_markup=reply_markup,
-                parse_mode=ParseMode.MARKDOWN
-            )
-            
-            # حفظ معرف الرسالة الموجهة لربطها بالطالب (عشان الرد السريع)
-            # data["msg_map"][str(forwarded_msg.message_id)] = user_id  <-- (الطريقة دي معقدة مع تعدد الأدمنز)
-            # الحل الأبسط للرد السريع: نعتمد على الـ Reply بتاعة تيليجرام
-            # لكن تيليجرام بيخفي أحياناً الـ User ID في الـ Forward
-            # لذلك سنقوم بتخزين الرابط محلياً:
-            # Map Admin's Forwarded Message ID -> Student ID
-            if "msg_map" not in data: data["msg_map"] = {}
-            data["msg_map"][f"{admin_id}_{forwarded_msg.message_id}"] = user_id
+async def ban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    try:
+        target_id = context.args[0]
+        if target_id not in data["banned"]:
+            data["banned"].append(target_id)
             save_data(data)
-
-        except Exception as e:
-            logger.error(f"Failed to send to admin {admin_id}: {e}")
-
-async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """معالجة رسائل الأدمن (سواء رد سريع أو محادثة مطولة)"""
-    admin_id = str(update.effective_user.id)
-    
-    # 1. الحالة الأولى: الأدمن فاتح محادثة مطولة (Long Chat Mode)
-    if admin_id in ACTIVE_CHATS:
-        student_id = ACTIVE_CHATS[admin_id]
-        try:
-            # نسخ الرسالة للطالب
-            await update.message.copy(chat_id=student_id)
-            # تأكيد للأدمن
-            await update.message.set_reaction("👍")
-        except Exception as e:
-            await update.message.reply_text(f"❌ لم تصل الرسالة (ربما حظر البوت): {e}")
-            del ACTIVE_CHATS[admin_id] # إنهاء المحادثة
-        return
-
-    # 2. الحالة الثانية: الأدمن بيعمل Reply عادي (One-Shot Reply)
-    if update.message.reply_to_message:
-        replied_msg_id = update.message.reply_to_message.message_id
-        
-        # البحث عن صاحب الرسالة الأصلية
-        # المفتاح في الداتا هو: "AdminID_MessageID"
-        key = f"{admin_id}_{replied_msg_id}"
-        
-        student_id = data.get("msg_map", {}).get(key)
-        
-        if student_id:
-            try:
-                await update.message.copy(chat_id=student_id)
-                await update.message.reply_text("✅ تم إرسال الرد السريع.")
-            except Exception as e:
-                await update.message.reply_text(f"❌ فشل الإرسال: {e}")
+            await update.message.reply_text(f"⛔ تم حظر الطالب `{target_id}`.", parse_mode=ParseMode.MARKDOWN)
         else:
-            # ممكن يكون بيرد على رسالة قديمة اتمسحت من الداتا أو رسالة بين الأدمنز
-            # نتجاهلها عشان منعملش إزعاج
-            pass
-        return
+            await update.message.reply_text("هذا الطالب محظور بالفعل.")
+    except IndexError:
+        await update.message.reply_text("استخدم: `/ban ID`", parse_mode=ParseMode.MARKDOWN)
 
-    # 3. الحالة الثالثة: أدمن بيكتب في الهواء (بدون رد وبدون محادثة مفتوحة)
-    # نتجاهله، أو ممكن نرد عليه نقوله "يا باشا اعمل ريبلاي"
-    if not update.message.text.startswith('/'): # نتجاهل الأوامر
-        await update.message.reply_text("⚠️ **تنبيه:**\nللرد على طالب، قم بعمل **Reply** على رسالته.\nأو اضغط زر **محادثة مطولة** لفتح شات.", parse_mode=ParseMode.MARKDOWN)
-
-# ==============================================================================
-# 4. BUTTONS & COMMANDS (الأزرار والأوامر)
-# ==============================================================================
-
-async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """التعامل مع زر فتح/غلق المحادثة المطولة"""
-    query = update.callback_query
-    await query.answer()
-    action = query.data
-    admin_id = str(update.effective_user.id)
-
-    # فتح محادثة
-    if action.startswith('chat_'):
-        student_id = action.split('_')[1]
-        
-        # تفعيل الوضع
-        ACTIVE_CHATS[admin_id] = student_id
-        
-        student_name = data["students"].get(student_id, {}).get("name", "الطالب")
-        
-        # زر الإغلاق
-        keyboard = [[InlineKeyboardButton("❌ إنهاء المحادثة", callback_data='close_chat')]]
-        
-        await query.edit_message_text(
-            f"🟢 **تم فتح محادثة مطولة مع {student_name}**\n\n"
-            "الآن أي رسالة سترسلها (بدون Reply) ستصل للطالب مباشرة.\n"
-            "عند الانتهاء اضغط إنهاء.",
-            reply_markup=InlineKeyboardMarkup(keyboard),
-            parse_mode=ParseMode.MARKDOWN
-        )
-        
-        # إشعار للطالب (اختياري)
-        try:
-            await context.bot.send_chat_action(chat_id=student_id, action=ChatAction.TYPING)
-        except: pass
-
-    # إغلاق محادثة
-    elif action == 'close_chat':
-        if admin_id in ACTIVE_CHATS:
-            del ACTIVE_CHATS[admin_id]
-            await query.edit_message_text("🔴 **تم إنهاء المحادثة المطولة.**\nعدنا لوضع الرد العادي (Reply).", parse_mode=ParseMode.MARKDOWN)
+async def unban_user_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    try:
+        target_id = context.args[0]
+        if target_id in data["banned"]:
+            data["banned"].remove(target_id)
+            save_data(data)
+            await update.message.reply_text(f"✅ تم فك الحظر عن `{target_id}`.", parse_mode=ParseMode.MARKDOWN)
         else:
-            await query.edit_message_text("⚠️ المحادثة مغلقة بالفعل.")
-
-async def admin_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = (
-        "🛠 **كيفية الرد:**\n"
-        "1️⃣ **رد سريع:** اضغط ضغطة مطولة على رسالة الطالب -> Reply -> اكتب ردك.\n"
-        "2️⃣ **نقاش طويل:** اضغط زر 'محادثة مطولة' أسفل رسالة الطالب.\n\n"
-        "📊 /stats - لعرض العدد."
-    )
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
-
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    count = len(data.get("students", {}))
-    await update.message.reply_text(f"👥 عدد الطلاب المسجلين: {count}")
+            await update.message.reply_text("هذا الطالب ليس محظوراً.")
+    except IndexError:
+        await update.message.reply_text("استخدم: `/unban ID`", parse_mode=ParseMode.MARKDOWN)
 
 async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
     if not update.message.reply_to_message and not context.args:
-        return await update.message.reply_text("📢 للبث: رد على رسالة بـ `/broadcast`")
-    
+        await update.message.reply_text("⚠️ للبث: رد على رسالة بـ `/broadcast` أو اكتب النص بعد الأمر.")
+        return
+
     students = data.get("students", {}).keys()
     msg = await update.message.reply_text(f"⏳ جاري البث لـ {len(students)} طالب...")
-    c = 0
-    for sid in students:
+    success = 0
+    
+    for student_id in students:
         try:
             if update.message.reply_to_message:
-                await update.message.reply_to_message.copy(chat_id=sid)
+                await update.message.reply_to_message.copy(chat_id=student_id)
             else:
-                await context.bot.send_message(chat_id=sid, text=" ".join(context.args))
-            c+=1
+                await context.bot.send_message(chat_id=student_id, text=' '.join(context.args))
+            success += 1
             await asyncio.sleep(0.05)
-        except: pass
-    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text=f"✅ تم البث لـ {c}")
+        except Exception: pass
+    
+    await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=msg.message_id, text=f"✅ تم البث بنجاح لـ: {success}")
 
 # ==============================================================================
-# 5. MAIN (التشغيل)
+# 4. CORE LOGIC (MESSAGING & LOCKING SYSTEM)
 # ==============================================================================
 
+async def handle_student_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    user = update.effective_user
+    user_id = str(user.id)
+
+    if user_id in data.get("banned", []):
+        return
+
+    # تسجيل الطالب
+    if user_id not in data["students"]:
+        data["students"][user_id] = {
+            "name": user.first_name,
+            "username": user.username,
+            "joined": str(datetime.now()),
+        }
+        save_data(data)
+        if CONTROLLER_ADMIN_ID:
+            try:
+                await context.bot.send_message(
+                    chat_id=int(CONTROLLER_ADMIN_ID),
+                    text=f"➕ طالب جديد: {user.first_name}",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+    # لو الطالب في محادثة مطوّلة مقفولة: ابعت للأدمن المسؤول فقط
+    if user_id in LOCKED_CHATS:
+        admin_id = int(LOCKED_CHATS[user_id]['admin_id'])
+        try:
+            fwd = await context.bot.forward_message(
+                chat_id=admin_id,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.effective_message.message_id,
+            )
+            ADMIN_MSG_MAP.setdefault(str(admin_id), {})[fwd.message_id] = user_id
+
+            kb = [[InlineKeyboardButton("❌ إنهاء المحادثة", callback_data=f"end_{user_id}")]]
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text="رد بالريبلاي على الرسالة اللي فوق.
+لو في وضع الرسالة المطوّلة: ابعت أجزاء الرسالة وبعدين اضغط إنهاء.",
+                reply_to_message_id=fwd.message_id,
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+        except Exception:
+            pass
+        return
+
+    # لو مش محجوز: طمّن الطالب وابعت رسالته للأدمنز
+    try:
+        await update.message.reply_text('تم الاستلام، سيتم الرد قريباً.. ⏳')
+    except Exception:
+        pass
+
+    for admin_id in ADMIN_IDS:
+        try:
+            admin_int = int(admin_id)
+
+            fwd = await context.bot.forward_message(
+                chat_id=admin_int,
+                from_chat_id=update.effective_chat.id,
+                message_id=update.effective_message.message_id,
+            )
+
+            # تخزين ربط الرسالة بالطالب عشان الأدمن يرد بالـ Reply
+            ADMIN_MSG_MAP.setdefault(str(admin_int), {})[fwd.message_id] = user_id
+
+            # رسالة تعليمات + زر الرسالة المطوّلة
+            kb = [[InlineKeyboardButton("✍️ رد برسالة مطوّلة", callback_data=f"long_{user_id}")]]
+            info = (
+                f"📩 من: {user.first_name} (ID: {user_id})
+"
+                f"@{user.username or 'NoUser'}
+
+"
+                "- للرد السريع: اعمل Reply على رسالة الطالب نفسها واكتب ردّك.
+"
+                "- لو محتاج تجمع رد طويل: اضغط زر (رد برسالة مطوّلة)."
+            )
+            await context.bot.send_message(
+                chat_id=admin_int,
+                text=info,
+                reply_to_message_id=fwd.message_id,
+                reply_markup=InlineKeyboardMarkup(kb),
+            )
+
+            # قصّ الماب لو كبر (استقرار RAM)
+            m = ADMIN_MSG_MAP.get(str(admin_int), {})
+            if len(m) > 500:
+                # امسح أقدم 200 عنصر
+                for k in sorted(m.keys())[:200]:
+                    m.pop(k, None)
+
+        except Exception:
+            pass
+
+async def _extract_student_id_from_reply(admin_id: str, replied_msg):
+    # 1) لو Telegram رجّع forward_from (مش دايماً بسبب الخصوصية)
+    try:
+        if replied_msg.forward_from and replied_msg.forward_from.id:
+            return str(replied_msg.forward_from.id)
+    except Exception:
+        pass
+
+    # 2) fallback: استخدم الماب اللي خزّنّاه وقت الإرسال
+    try:
+        return ADMIN_MSG_MAP.get(admin_id, {}).get(replied_msg.message_id)
+    except Exception:
+        return None
+
+
+async def _send_admin_message_to_student(update: Update, context: ContextTypes.DEFAULT_TYPE, student_id: str):
+    try:
+        await context.bot.send_chat_action(chat_id=int(student_id), action=ChatAction.TYPING)
+    except Exception:
+        pass
+
+    # copy أفضل من forward عشان ميظهرش عند الطالب إنه فوروورد من الأدمن
+    await update.effective_message.copy(chat_id=int(student_id))
+
+
+async def handle_admin_reply_mode(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    admin_id = str(update.effective_user.id)
+    msg = update.effective_message
+
+    # 1) وضع الرسالة المطوّلة: نجمع أجزاء لحد ما يضغط إنهاء
+    if admin_id in LONG_SESSIONS:
+        if msg.text and msg.text.startswith('/'):
+            return
+        # نخزّن النصوص فقط (لو محتاج وسائط ابعته كـ Reply عادي خارج الوضع ده)
+        text = msg.text or msg.caption
+        if text:
+            LONG_SESSIONS[admin_id]['parts'].append(text)
+            await msg.reply_text("✅ تم حفظ الجزء. ابعت جزء تاني أو اضغط (إنهاء المحادثة).")
+        else:
+            await msg.reply_text("⚠️ الوضع المطوّل بيجمع نصوص فقط. ابعت نص أو اخرج من الوضع بالضغط على إنهاء.")
+        return
+
+    # 2) الرد السريع: لازم يبقى Reply على رسالة الطالب (اللي البوت بعتها للأدمن)
+    if not msg.reply_to_message:
+        return
+
+    student_id = await _extract_student_id_from_reply(admin_id, msg.reply_to_message)
+    if not student_id:
+        await msg.reply_text("⚠️ مش قادر أحدد الطالب. لازم تعمل Reply على رسالة الطالب اللي وصلتلك من البوت.")
+        return
+
+    # لو في قفل، لازم الأدمن صاحب القفل
+    if student_id in LOCKED_CHATS and LOCKED_CHATS[student_id]['admin_id'] != admin_id:
+        await msg.reply_text("⛔ المحادثة دي مقفولة عند أدمن تاني حالياً.")
+        return
+
+    try:
+        await _send_admin_message_to_student(update, context, student_id)
+    except Exception as e:
+        await msg.reply_text(f"❌ لم تصل الرسالة (الطالب حظر البوت؟): {e}")
+
+
+# ==============================================================================
+# 5. BUTTONS HANDLER (THE MAGIC HAPPENS HERE)
+# ==============================================================================
+
+async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data
+    admin_id = str(update.effective_user.id)
+    admin_name = update.effective_user.first_name
+
+    # بدء وضع رسالة مطوّلة
+    if action.startswith('long_'):
+        student_id = action.split('_', 1)[1]
+
+        # لو في قفل لشخص تاني
+        if student_id in LOCKED_CHATS and LOCKED_CHATS[student_id]['admin_id'] != admin_id:
+            current_owner = LOCKED_CHATS[student_id]['admin_name']
+            await context.bot.answer_callback_query(query.id, text=f"⛔ الأدمن {current_owner} ماسك المحادثة دي.", show_alert=True)
+            return
+
+        # فعّل القفل وابدأ سيشن تجميع
+        LOCKED_CHATS[student_id] = {'admin_id': admin_id, 'admin_name': admin_name}
+        LONG_SESSIONS[admin_id] = {'student_id': student_id, 'parts': []}
+
+        kb = [[InlineKeyboardButton("❌ إنهاء المحادثة", callback_data=f'end_{student_id}')]]
+        student_name = data.get('students', {}).get(student_id, {}).get('name', 'الطالب')
+
+        await query.message.reply_text(
+            f"🟢 دخلت وضع الرسالة المطوّلة مع {student_name}.
+"
+            "ابعت أجزاء الرسالة (نصوص) وانا هاجمعها، ولما تخلص اضغط (إنهاء المحادثة).",
+            reply_markup=InlineKeyboardMarkup(kb),
+        )
+
+        if CONTROLLER_ADMIN_ID and admin_id != str(CONTROLLER_ADMIN_ID):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(CONTROLLER_ADMIN_ID),
+                    text=f"🔒 الأدمن **{admin_name}** بدأ رسالة مطوّلة للطالب `{student_id}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return
+
+    # إنهاء المحادثة / إرسال الرسالة المطوّلة وفك القفل
+    if action.startswith('end_'):
+        student_id = action.split('_', 1)[1]
+
+        # صلاحيات إنهاء القفل
+        if student_id in LOCKED_CHATS and LOCKED_CHATS[student_id]['admin_id'] != admin_id:
+            await context.bot.answer_callback_query(query.id, text="ليس لديك صلاحية لإنهاء محادثة زميلك!", show_alert=True)
+            return
+
+        # لو كان في سيشن مطوّل: ابعت الرسالة المجمعة
+        session = LONG_SESSIONS.get(admin_id)
+        if session and session.get('student_id') == student_id:
+            parts = [p.strip() for p in session.get('parts', []) if p and p.strip()]
+            text = "
+
+".join(parts).strip()
+
+            if text:
+                # لو النص كبير، قسّمه
+                max_len = 3800
+                chunks = [text[i:i+max_len] for i in range(0, len(text), max_len)]
+                for ch in chunks:
+                    try:
+                        await context.bot.send_message(chat_id=int(student_id), text=ch)
+                    except Exception as e:
+                        await query.message.reply_text(f"❌ فشل الإرسال للطالب: {e}")
+                        break
+            else:
+                await query.message.reply_text("⚠️ مفيش نصوص متجمعة للإرسال.")
+
+            LONG_SESSIONS.pop(admin_id, None)
+
+        # فك القفل
+        if student_id in LOCKED_CHATS:
+            del LOCKED_CHATS[student_id]
+
+        await query.message.reply_text("✅ تم إنهاء المحادثة وفك القفل.")
+
+        if CONTROLLER_ADMIN_ID and admin_id != str(CONTROLLER_ADMIN_ID):
+            try:
+                await context.bot.send_message(
+                    chat_id=int(CONTROLLER_ADMIN_ID),
+                    text=f"🔓 الأدمن **{admin_name}** أنهى المحادثة مع `{student_id}`",
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+        return
+
+    # أدوات الأدمن
+    if action == 'stats_btn':
+        await query.message.reply_text(f"👥 الطلاب: {len(data.get('students', {}))}
+🔒 محادثات جارية: {len(LOCKED_CHATS)}")
+
+    elif action == 'force_unlock_all':
+        if admin_id == str(CONTROLLER_ADMIN_ID):
+            LOCKED_CHATS.clear()
+            LONG_SESSIONS.clear()
+            await query.message.reply_text("🔓⚠️ تم فك قفل جميع المحادثات إجبارياً!")
+        else:
+            await context.bot.answer_callback_query(query.id, text="هذا الزر للمدير المراقب فقط!", show_alert=True)
+
+    elif action == 'help_broadcast':
+        await query.message.reply_text("📢 للبث: رد على رسالة بـ `/broadcast`", parse_mode=ParseMode.MARKDOWN)
+
+    elif action == 'help_ban':
+        await query.message.reply_text("🚫 `/ban ID` للحظر", parse_mode=ParseMode.MARKDOWN)
+
+
+# ==============================================================================
+# 6. ROUTER
+# ==============================================================================
 async def main_router(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    """الموزع الرئيسي"""
-    if str(update.effective_user.id) in ADMIN_IDS:
-        await handle_admin_message(update, context, data)
-    else:
-        await handle_student_message(update, context, data)
+    user_id = str(update.effective_user.id)
 
+    # رسائل الأدمن
+    if user_id in ADMIN_IDS:
+        if update.effective_message.text and update.effective_message.text.startswith('/'):
+            return
+        await handle_admin_reply_mode(update, context, data)
+        return
+
+    # رسائل الطلاب
+    await handle_student_message(update, context, data)
+
+
+# ==============================================================================
+# 7. MAIN
+# ==============================================================================
 def main():
-    start_keep_alive() # تشغيل السيرفر
+    start_keep_alive()
     bot_data = load_data()
     app = Application.builder().token(TOKEN).build()
     
     p = partial
     router_p = p(main_router, data=bot_data)
     btns_p = p(buttons_handler, data=bot_data)
+    ban_p = p(ban_user_command, data=bot_data)
+    unban_p = p(unban_user_command, data=bot_data)
+    broad_p = p(broadcast_command, data=bot_data)
     
-    # أوامر
-    app.add_handler(CommandHandler("start", partial(start_command, data=bot_data)))
-    app.add_handler(CommandHandler("help", admin_help))
-    app.add_handler(CommandHandler("stats", partial(stats_command, data=bot_data)))
-    app.add_handler(CommandHandler("broadcast", partial(broadcast_command, data=bot_data)))
+    start_p = p(lambda u,c,d: u.message.reply_text("أهلاً بك!"), data=bot_data) # Simple start for brevity
+    
+    admin_only = filters.User(user_id=[int(uid) for uid in ADMIN_IDS])
+
+    app.add_handler(CommandHandler("start", partial(lambda u,c,d: u.message.reply_text("أهلاً بك! ابعت سؤالك."), data=bot_data)))
+    app.add_handler(CommandHandler("admin", admin_panel, filters=admin_only))
+    app.add_handler(CommandHandler("ban", ban_p, filters=admin_only))
+    app.add_handler(CommandHandler("unban", unban_p, filters=admin_only))
+    app.add_handler(CommandHandler("broadcast", broad_p, filters=admin_only))
     
     app.add_handler(CallbackQueryHandler(btns_p))
     app.add_handler(MessageHandler(filters.ALL & ~filters.COMMAND, router_p))
 
-    print("Bot is Running Simple & Pro Mode...")
+    print("Bot is Running Legendary Mode...")
     app.run_polling()
 
 if __name__ == '__main__':
