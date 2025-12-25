@@ -107,10 +107,10 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data
         await notify_controller(context, f"➕ **طالب جديد:** {user.first_name} (`{user_id}`)")
 
     await update.message.reply_text(
-        "👋 **أهلاً بك!**\n\n"
-        "أرسل سؤالك الآن (نص، صورة، صوت، فيديو...)\n"
-        "نحن ندعم جميع أنواع الرسائل. 🎤📷\n"
-        "وسيقوم المشرفون بالرد عليك قريباً. 🤍"
+        "👋 السلام عليكم\n\n"
+        # "إبعت رسالتك يا دكتور \n"
+        # "نحن ندعم جميع أنواع الرسائل. 🎤📷\n"
+        "ابعت رسالتك يا دكتور وهنرد عليك فأقرب وقت 🤍"
     )
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -195,7 +195,7 @@ async def handle_student_message(update: Update, context: ContextTypes.DEFAULT_T
         return
 
     # 2. رسالة جديدة (مش محجوزة)
-    await update.message.reply_text("✅ وصل سؤالك، انتظر الرد.", quote=True)
+    await update.message.reply_text("✅ وصل سؤالك، استني دقايق وهنرد عليك.", quote=True)
     
     keyboard = [[InlineKeyboardButton("🗣️ فتح محادثة (Long Chat)", callback_data=f'chat_{user_id}')]]
     reply_markup = InlineKeyboardMarkup(keyboard)
