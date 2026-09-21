@@ -1,0 +1,24 @@
+name: Xavier Bot CI
+
+on:
+  push:
+    branches: [main, xavier-broadcast-v2]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Compile
+        run: python -m py_compile bot_advanced.py
+      - name: Telegram compatibility smoke check
+        run: |
+          python -c "import bot_advanced"
+          python -c "from telegram.ext import filters; assert hasattr(filters, 'CaptionRegex')"
