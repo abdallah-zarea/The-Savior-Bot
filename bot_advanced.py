@@ -33,14 +33,18 @@ OWNER_ID = os.environ.get("OWNER_ID", "").strip()
 DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
 PORT = int(os.environ.get("PORT", "10000"))
 
-if not BOT_TOKEN:
-    raise RuntimeError("BOT_TOKEN is required")
-if not OWNER_ID.isdigit():
-    raise RuntimeError("OWNER_ID must be a numeric Telegram user ID")
-if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL is required; Xavier will not use ephemeral local storage")
+OWNER_ID_INT = int(OWNER_ID) if OWNER_ID.isdigit() else 0
 
-OWNER_ID_INT = int(OWNER_ID)
+
+def validate_config():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is required")
+    if not OWNER_ID.isdigit():
+        raise RuntimeError("OWNER_ID must be a numeric Telegram user ID")
+    if not DATABASE_URL:
+        raise RuntimeError(
+            "DATABASE_URL is required; Xavier will not use ephemeral local storage"
+        )
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -583,6 +587,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 # =============================================================================
 
 def main():
+    validate_config()
     init_db()
     start_web()
 
