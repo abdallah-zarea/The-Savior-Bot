@@ -18,3 +18,7 @@ jobs:
         run: pip install -r requirements.txt
       - name: Compile
         run: python -m py_compile bot_advanced.py
+      - name: Telegram compatibility smoke check
+        run: |
+          python -c "import bot_advanced"
+          python -c "from telegram.ext import filters; assert hasattr(filters, 'CaptionRegex')"
