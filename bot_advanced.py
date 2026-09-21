@@ -312,7 +312,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, da
     await query.answer()
 
     if not is_admin(update.effective_user.id):
-        await query.answer("⛔ غير مصرح.", show_alert=True)
+        await query.message.reply_text("⛔ غير مصرح.")
         return
 
     action = query.data
@@ -326,7 +326,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, da
             if LOCKED_CHATS[sid]["admin_id"] == admin_id:
                 await query.edit_message_text("✅ المحادثة معك.")
             else:
-                await query.answer(f"⛔ {owner} يتحدث معه!", show_alert=True)
+                await query.message.reply_text(f"⛔ {owner} يتحدث معه!")
             return
 
         LOCKED_CHATS[sid] = {"admin_id": admin_id, "admin_name": admin_name}
@@ -341,7 +341,7 @@ async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, da
         sid = action.split("_", 1)[1]
         if sid in LOCKED_CHATS:
             if LOCKED_CHATS[sid]["admin_id"] != admin_id:
-                await query.answer("لست صاحب المحادثة!", show_alert=True)
+                await query.message.reply_text("⛔ لست صاحب المحادثة!")
                 return
             LOCKED_CHATS.pop(sid, None)
             await query.edit_message_text("✅ تم الإنهاء.")
