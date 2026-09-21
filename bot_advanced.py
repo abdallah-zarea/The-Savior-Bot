@@ -1,651 +1,629 @@
-import logging
-import json
-import os
 import asyncio
-from functools import partial
-from datetime import datetime
+import logging
+import os
+from datetime import datetime, timezone
 from threading import Thread
 
-# --- Flask Server for Render ---
+import psycopg
 from flask import Flask
-
-# --- Telegram Libraries ---
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import BadRequest, Conflict, Forbidden, RetryAfter, TelegramError
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
-    filters,
+    CommandHandler,
     ContextTypes,
+    MessageHandler,
+    filters,
 )
-from telegram.constants import ParseMode
-from telegram.error import BadRequest, Forbidden, RetryAfter, TelegramError
 
-try:
-    import psycopg
-except ImportError:
-    psycopg = None
+# =============================================================================
+# XAVIER BOT — CLEAN CORE
+# =============================================================================
+# Security principles:
+# - No bot token in source code.
+# - Exactly one owner, supplied by OWNER_ID.
+# - No forced-channel join logic.
+# - No local JSON persistence on Render.
+# - PostgreSQL is mandatory so redeploys cannot erase users.
+# =============================================================================
 
-# ==============================================================================
-# 0. WEB SERVER (KEEP ALIVE)
-# ==============================================================================
-app = Flask('')
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+OWNER_ID = os.environ.get("OWNER_ID", "").strip()
+DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+PORT = int(os.environ.get("PORT", "10000"))
 
-@app.route('/')
-def home():
-    return "🚀 Bot is Running - Fix Applied!"
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN is required")
+if not OWNER_ID.isdigit():
+    raise RuntimeError("OWNER_ID must be a numeric Telegram user ID")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL is required; Xavier will not use ephemeral local storage")
 
-def run_web_server():
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
-
-def start_keep_alive():
-    t = Thread(target=run_web_server, daemon=True)
-    t.start()
-
-# ==============================================================================
-# 1. CONFIGURATION (الإعدادات)
-# ==============================================================================
-TOKEN = os.environ.get("BOT_TOKEN")
-ADMIN_IDS_STR = os.environ.get("ADMIN_IDS", "5324699237,5742283044,1207574750,6125721799,5933051169,5361987371,1388167296")
-CONTROLLER_ADMIN_ID = os.environ.get("CONTROLLER_ADMIN_ID", "1388167296")
-DATABASE_URL = os.environ.get("DATABASE_URL")
-
-# تحويل جميع الـ IDs إلى نصوص (Strings) لضمان التوافق
-ADMIN_IDS = [str(aid.strip()) for aid in ADMIN_IDS_STR.split(',') if aid.strip()]
-DATA_FILE = "bot_data.json"
+OWNER_ID_INT = int(OWNER_ID)
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("xavier")
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
-# ==============================================================================
-# 2. DATA MANAGEMENT
-# ==============================================================================
-LOCKED_CHATS = {}
-REPLY_MAP = {}
+web = Flask(__name__)
 
-def now_iso():
-    return datetime.utcnow().isoformat() + "Z"
 
-def default_data():
-    return {"students": {}, "banned": []}
+@web.get("/")
+def health():
+    return {"service": "Xavier Bot", "status": "ok"}, 200
 
-def normalize_data(data):
-    if not isinstance(data, dict):
-        data = {}
-    data.setdefault("students", {})
-    data.setdefault("banned", [])
-    if not isinstance(data["students"], dict):
-        data["students"] = {}
-    if not isinstance(data["banned"], list):
-        data["banned"] = []
-    return data
+
+def run_web():
+    web.run(host="0.0.0.0", port=PORT)
+
+
+def start_web():
+    Thread(target=run_web, daemon=True).start()
+
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+
+def db():
+    return psycopg.connect(DATABASE_URL)
+
 
 def init_db():
-    if not DATABASE_URL or psycopg is None:
-        return
-    with psycopg.connect(DATABASE_URL) as conn:
+    with db() as conn:
         conn.execute(
             """
-            CREATE TABLE IF NOT EXISTS bot_state (
-                id SMALLINT PRIMARY KEY,
-                payload JSONB NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                first_name TEXT,
+                username TEXT,
+                first_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                last_seen TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                active BOOLEAN NOT NULL DEFAULT TRUE,
+                blocked_by_bot BOOLEAN NOT NULL DEFAULT FALSE
             )
             """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS banned_users (
+                user_id BIGINT PRIMARY KEY,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS relay_map (
+                owner_message_id BIGINT PRIMARY KEY,
+                user_id BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS broadcast_runs (
+                id BIGSERIAL PRIMARY KEY,
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                finished_at TIMESTAMPTZ,
+                total INTEGER NOT NULL DEFAULT 0,
+                sent INTEGER NOT NULL DEFAULT 0,
+                blocked INTEGER NOT NULL DEFAULT 0,
+                failed INTEGER NOT NULL DEFAULT 0
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_users_active ON users(active)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_relay_created ON relay_map(created_at)"
         )
         conn.commit()
 
-def _load_local_data():
-    try:
-        with open(DATA_FILE, "r", encoding="utf-8") as f:
-            return normalize_data(json.load(f))
-    except (FileNotFoundError, json.JSONDecodeError):
-        return default_data()
-    except Exception as exc:
-        logger.error("Local data load failed: %s", exc)
-        return default_data()
 
-def load_data():
-    if DATABASE_URL and psycopg is not None:
-        try:
-            init_db()
-            with psycopg.connect(DATABASE_URL) as conn:
-                row = conn.execute("SELECT payload FROM bot_state WHERE id = 1").fetchone()
-                if row:
-                    payload = row[0]
-                    if isinstance(payload, str):
-                        payload = json.loads(payload)
-                    return normalize_data(payload)
+def upsert_user(user):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users (user_id, first_name, username, first_seen, last_seen, active, blocked_by_bot)
+            VALUES (%s, %s, %s, NOW(), NOW(), TRUE, FALSE)
+            ON CONFLICT (user_id) DO UPDATE SET
+                first_name = EXCLUDED.first_name,
+                username = EXCLUDED.username,
+                last_seen = NOW(),
+                active = TRUE,
+                blocked_by_bot = FALSE
+            """,
+            (user.id, user.first_name, user.username),
+        )
+        conn.commit()
 
-            local_data = _load_local_data()
-            save_data(local_data)
-            return local_data
-        except Exception as exc:
-            logger.error("Database load failed; using local fallback: %s", exc)
 
-    return _load_local_data()
+def is_banned(user_id: int) -> bool:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT 1 FROM banned_users WHERE user_id = %s",
+            (user_id,),
+        ).fetchone()
+        return bool(row)
 
-def save_data(data):
-    data = normalize_data(data)
 
-    if DATABASE_URL and psycopg is not None:
-        try:
-            init_db()
-            payload = json.dumps(data, ensure_ascii=False)
-            with psycopg.connect(DATABASE_URL) as conn:
-                conn.execute(
-                    """
-                    INSERT INTO bot_state (id, payload, updated_at)
-                    VALUES (1, %s::jsonb, NOW())
-                    ON CONFLICT (id)
-                    DO UPDATE SET payload = EXCLUDED.payload, updated_at = NOW()
-                    """,
-                    (payload,),
-                )
-                conn.commit()
-            return
-        except Exception as exc:
-            logger.error("Database save failed; using local fallback: %s", exc)
+def set_banned(user_id: int, banned: bool):
+    with db() as conn:
+        if banned:
+            conn.execute(
+                "INSERT INTO banned_users(user_id) VALUES (%s) ON CONFLICT DO NOTHING",
+                (user_id,),
+            )
+        else:
+            conn.execute("DELETE FROM banned_users WHERE user_id = %s", (user_id,))
+        conn.commit()
 
-    try:
-        with open(DATA_FILE, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=4)
-    except Exception as exc:
-        logger.error("Local data save failed: %s", exc)
 
-def is_admin(user_id):
-    return str(user_id) in ADMIN_IDS
+def active_user_ids():
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT user_id FROM users WHERE active = TRUE ORDER BY user_id"
+        ).fetchall()
+        return [int(r[0]) for r in rows]
 
-def touch_student(data, user):
-    uid = str(user.id)
-    profile = data["students"].get(uid)
-    if profile is None:
-        profile = {
-            "name": user.first_name,
-            "username": user.username,
-            "first_seen": now_iso(),
-        }
-        data["students"][uid] = profile
 
-    profile["name"] = user.first_name
-    profile["username"] = user.username
-    profile["last_seen"] = now_iso()
-    profile["blocked"] = False
-    return profile
+def mark_unreachable(user_id: int):
+    with db() as conn:
+        conn.execute(
+            "UPDATE users SET active = FALSE, blocked_by_bot = TRUE WHERE user_id = %s",
+            (user_id,),
+        )
+        conn.commit()
 
-async def deny_if_not_admin(update):
-    if is_admin(update.effective_user.id):
-        return False
+
+def stats():
+    with db() as conn:
+        total = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+        active = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE active = TRUE"
+        ).fetchone()[0]
+        blocked = conn.execute(
+            "SELECT COUNT(*) FROM users WHERE blocked_by_bot = TRUE"
+        ).fetchone()[0]
+        banned = conn.execute("SELECT COUNT(*) FROM banned_users").fetchone()[0]
+        return int(total), int(active), int(blocked), int(banned)
+
+
+def save_relay(owner_message_id: int, user_id: int):
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO relay_map(owner_message_id, user_id, created_at)
+            VALUES (%s, %s, NOW())
+            ON CONFLICT (owner_message_id)
+            DO UPDATE SET user_id = EXCLUDED.user_id, created_at = NOW()
+            """,
+            (owner_message_id, user_id),
+        )
+        conn.execute(
+            "DELETE FROM relay_map WHERE created_at < NOW() - INTERVAL '30 days'"
+        )
+        conn.commit()
+
+
+def relay_target(owner_message_id: int):
+    with db() as conn:
+        row = conn.execute(
+            "SELECT user_id FROM relay_map WHERE owner_message_id = %s",
+            (owner_message_id,),
+        ).fetchone()
+        return int(row[0]) if row else None
+
+
+def create_broadcast_run(total: int) -> int:
+    with db() as conn:
+        row = conn.execute(
+            "INSERT INTO broadcast_runs(total) VALUES (%s) RETURNING id",
+            (total,),
+        ).fetchone()
+        conn.commit()
+        return int(row[0])
+
+
+def finish_broadcast_run(run_id: int, sent: int, blocked: int, failed: int):
+    with db() as conn:
+        conn.execute(
+            """
+            UPDATE broadcast_runs
+            SET finished_at = NOW(), sent = %s, blocked = %s, failed = %s
+            WHERE id = %s
+            """,
+            (sent, blocked, failed, run_id),
+        )
+        conn.commit()
+
+
+# =============================================================================
+# AUTH / UI
+# =============================================================================
+
+def is_owner(update: Update) -> bool:
+    return bool(update.effective_user and update.effective_user.id == OWNER_ID_INT)
+
+
+async def owner_only(update: Update) -> bool:
+    if is_owner(update):
+        return True
     if update.effective_message:
-        await update.effective_message.reply_text("⛔ هذا الأمر مخصص للإدارة فقط.")
-    return True
+        await update.effective_message.reply_text("⛔ غير مصرح.")
+    return False
 
-async def notify_controller(context, text):
-    if not CONTROLLER_ADMIN_ID:
-        return
-    try:
-        await context.bot.send_message(chat_id=CONTROLLER_ADMIN_ID, text=text)
-    except Exception as exc:
-        logger.error("Controller notify error: %s", exc)
 
-# ==============================================================================
-# 3. COMMANDS / STUDENT LOGIC
-# ==============================================================================
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    user = update.effective_user
-    user_id = str(user.id)
-
-    if is_admin(user_id):
-        await update.message.reply_text("👮‍♂️ Xavier Admin mode is active. استخدم /admin")
-        return
-
-    if user_id in data.get("banned", []):
-        return
-
-    is_new = user_id not in data["students"]
-    touch_student(data, user)
-    save_data(data)
-
-    if is_new:
-        await notify_controller(context, f"➕ طالب جديد: {user.first_name} ({user_id})")
-
-    await update.message.reply_text(
-        "👋 أهلاً بك! أرسل رسالتك الآن (نص، صورة، صوت) وسنرد عليك."
+def admin_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("📊 الإحصائيات", callback_data="stats")],
+            [InlineKeyboardButton("📢 طريقة البث", callback_data="broadcast_help")],
+        ]
     )
 
-async def handle_student_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
+
+async def show_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    await update.effective_message.reply_text(
+        "🛡️ Xavier Control\n\n"
+        "أنت المالك الوحيد المصرح له حاليًا.\n"
+        "لا يوجد Force Join أو قناة إجبارية في هذه النسخة.",
+        reply_markup=admin_keyboard(),
+    )
+
+
+# =============================================================================
+# USER FLOW
+# =============================================================================
+
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if is_owner(update):
+        await show_admin(update, context)
+        return
+
     user = update.effective_user
-    user_id = str(user.id)
-
-    if user_id in data.get("banned", []):
+    if is_banned(user.id):
         return
 
-    touch_student(data, user)
-    save_data(data)
+    upsert_user(user)
+    await update.effective_message.reply_text(
+        "👋 أهلاً بك في Xavier.\n"
+        "أرسل رسالتك أو صورتك أو الملف، وسيتم تحويله للإدارة."
+    )
 
-    if user_id in LOCKED_CHATS:
-        admin_data = LOCKED_CHATS[user_id]
-        target_admin = admin_data["admin_id"]
-        try:
-            forwarded = await update.message.forward(chat_id=target_admin)
-            REPLY_MAP[f"{target_admin}_{forwarded.message_id}"] = user_id
-            kb = [[InlineKeyboardButton("❌ إنهاء", callback_data=f"end_{user_id}")]]
-            await context.bot.send_message(
-                chat_id=target_admin,
-                text="💬 رسالة جديدة:",
-                reply_to_message_id=forwarded.message_id,
-                reply_markup=InlineKeyboardMarkup(kb),
-            )
-        except Exception as exc:
-            logger.error("Failed to send to admin %s: %s", target_admin, exc)
-            LOCKED_CHATS.pop(user_id, None)
-        return
 
-    try:
-        await update.message.reply_text("✅ وصل سؤالك، انتظر الرد.")
-    except Exception as exc:
-        logger.error("Failed to reply to student: %s", exc)
-
-    kb = [[InlineKeyboardButton("🗣️ فتح محادثة", callback_data=f"chat_{user_id}")]]
-    msg_text = f"📩 تذكرة جديدة\n👤 {user.first_name} ({user_id})"
-
-    for admin_id in ADMIN_IDS:
-        try:
-            await context.bot.send_message(chat_id=admin_id, text=msg_text)
-            forwarded = await update.message.forward(chat_id=admin_id)
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text="👇 للرد: اضغط Reply أو الزر:",
-                reply_markup=InlineKeyboardMarkup(kb),
-                reply_to_message_id=forwarded.message_id,
-            )
-            REPLY_MAP[f"{admin_id}_{forwarded.message_id}"] = user_id
-        except Exception as exc:
-            logger.error("Broadcasting to admin %s failed: %s", admin_id, exc)
-
-# ==============================================================================
-# 4. ADMIN LOGIC
-# ==============================================================================
-async def handle_admin_message(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    admin_id = str(update.effective_user.id)
+async def handle_student(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
     msg = update.effective_message
 
-    if msg.text and msg.text.startswith("/"):
+    if not user or not msg or user.id == OWNER_ID_INT:
+        return
+    if is_banned(user.id):
         return
 
-    target_student = None
-
-    for sid, info in LOCKED_CHATS.items():
-        if info["admin_id"] == admin_id:
-            target_student = sid
-            break
-
-    if not target_student and msg.reply_to_message:
-        map_key = f"{admin_id}_{msg.reply_to_message.message_id}"
-        target_student = REPLY_MAP.get(map_key)
-
-    if target_student:
-        try:
-            await msg.copy(chat_id=target_student)
-            try:
-                await msg.set_reaction("👍")
-            except Exception:
-                pass
-        except Exception as exc:
-            await msg.reply_text(f"❌ فشل الإرسال: {exc}")
-            LOCKED_CHATS.pop(target_student, None)
-    else:
-        await msg.reply_text("⚠️ للرد: استخدم Reply على رسالة الطالب أو افتح محادثة.")
-
-# ==============================================================================
-# 5. BUTTONS
-# ==============================================================================
-async def buttons_handler(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    query = update.callback_query
-    await query.answer()
-
-    if not is_admin(update.effective_user.id):
-        await query.message.reply_text("⛔ غير مصرح.")
-        return
-
-    action = query.data
-    admin_id = str(update.effective_user.id)
-    admin_name = update.effective_user.first_name
-
-    if action.startswith("chat_"):
-        sid = action.split("_", 1)[1]
-        if sid in LOCKED_CHATS:
-            owner = LOCKED_CHATS[sid]["admin_name"]
-            if LOCKED_CHATS[sid]["admin_id"] == admin_id:
-                await query.edit_message_text("✅ المحادثة معك.")
-            else:
-                await query.message.reply_text(f"⛔ {owner} يتحدث معه!")
-            return
-
-        LOCKED_CHATS[sid] = {"admin_id": admin_id, "admin_name": admin_name}
-        kb = [[InlineKeyboardButton("❌ إنهاء", callback_data=f"end_{sid}")]]
-        await query.edit_message_text(
-            "🟢 بدأت المحادثة.\nأرسل ردودك مباشرة.",
-            reply_markup=InlineKeyboardMarkup(kb),
-        )
-        await notify_controller(context, f"🔒 {admin_name} بدأ مع {sid}")
-
-    elif action.startswith("end_"):
-        sid = action.split("_", 1)[1]
-        if sid in LOCKED_CHATS:
-            if LOCKED_CHATS[sid]["admin_id"] != admin_id:
-                await query.message.reply_text("⛔ لست صاحب المحادثة!")
-                return
-            LOCKED_CHATS.pop(sid, None)
-            await query.edit_message_text("✅ تم الإنهاء.")
-            await notify_controller(context, f"🔓 {admin_name} أنهى مع {sid}")
-        else:
-            await query.edit_message_text("⚠️ منتهية.")
-
-    elif action == "stats_btn":
-        students = data.get("students", {})
-        blocked = sum(1 for p in students.values() if p.get("blocked"))
-        active = len(students) - blocked
-        await query.message.reply_text(
-            f"👥 إجمالي المستخدمين: {len(students)}\n"
-            f"✅ نشط: {active}\n"
-            f"🚫 حظر البوت: {blocked}\n"
-            f"⛔ محظور إداريًا: {len(data.get('banned', []))}"
-        )
-
-    elif action == "force_unlock":
-        if admin_id == CONTROLLER_ADMIN_ID:
-            LOCKED_CHATS.clear()
-            await query.message.reply_text("✅ تم فك كل الأقفال.")
-
-    elif action == "help_broadcast":
-        await query.message.reply_text(
-            "📢 Broadcast V2\n"
-            "1) اعمل Reply على الصورة/الرسالة ثم اكتب /broadcast أو #broadcast\n"
-            "2) أو ابعت صورة Caption يبدأ بـ #broadcast"
-        )
-
-    elif action == "help_ban":
-        await query.message.reply_text("/ban ID\n/unban ID")
-
-# ==============================================================================
-# 6. ADMIN COMMANDS + BROADCAST V2
-# ==============================================================================
-async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if await deny_if_not_admin(update):
-        return
-
-    kb = [
-        [InlineKeyboardButton("📊 إحصائيات", callback_data="stats_btn")],
-        [InlineKeyboardButton("🔓 فك قفل", callback_data="force_unlock")],
-        [
-            InlineKeyboardButton("📢 بث", callback_data="help_broadcast"),
-            InlineKeyboardButton("🚫 حظر", callback_data="help_ban"),
-        ],
-    ]
-    await update.message.reply_text(
-        "👮‍♂️ Xavier Control Panel",
-        reply_markup=InlineKeyboardMarkup(kb),
-    )
-
-async def ban_user(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if await deny_if_not_admin(update):
-        return
-    if not context.args:
-        await update.message.reply_text("الاستخدام: /ban ID")
-        return
-
-    target = str(context.args[0]).strip()
-    banned = data.setdefault("banned", [])
-    if target not in banned:
-        banned.append(target)
-        save_data(data)
-    await update.message.reply_text(f"✅ تم حظر {target}")
-
-async def unban_user(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if await deny_if_not_admin(update):
-        return
-    if not context.args:
-        await update.message.reply_text("الاستخدام: /unban ID")
-        return
-
-    target = str(context.args[0]).strip()
-    if target in data.get("banned", []):
-        data["banned"].remove(target)
-        save_data(data)
-        await update.message.reply_text(f"✅ تم فك حظر {target}")
-    else:
-        await update.message.reply_text("ℹ️ المستخدم غير موجود في قائمة الحظر.")
-
-async def _copy_broadcast(context, source_message, sid, caption_override=None):
-    kwargs = {
-        "chat_id": sid,
-        "from_chat_id": source_message.chat_id,
-        "message_id": source_message.message_id,
-    }
-    if caption_override is not None:
-        kwargs["caption"] = caption_override
-    await context.bot.copy_message(**kwargs)
-
-async def _send_with_retry(context, sid, source_message=None, text=None, caption_override=None):
-    async def do_send():
-        if source_message is not None:
-            await _copy_broadcast(context, source_message, sid, caption_override)
-        else:
-            await context.bot.send_message(chat_id=sid, text=text)
+    upsert_user(user)
 
     try:
-        await do_send()
-        return "success", None
-    except RetryAfter as exc:
-        delay = exc.retry_after
-        if hasattr(delay, "total_seconds"):
-            delay = delay.total_seconds()
-        await asyncio.sleep(float(delay) + 0.5)
-        try:
-            await do_send()
-            return "success", None
-        except Forbidden as retry_exc:
-            return "blocked", str(retry_exc)
-        except TelegramError as retry_exc:
-            return "failed", str(retry_exc)
-    except Forbidden as exc:
-        return "blocked", str(exc)
-    except (BadRequest, TelegramError) as exc:
-        return "failed", str(exc)
-    except Exception as exc:
-        return "failed", str(exc)
+        await msg.reply_text("✅ تم استلام رسالتك.")
+    except TelegramError:
+        pass
 
-async def run_broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-    data: dict,
-    source_message=None,
-    text=None,
-    caption_override=None,
-):
-    if await deny_if_not_admin(update):
+    try:
+        header = await context.bot.send_message(
+            chat_id=OWNER_ID_INT,
+            text=(
+                "📩 رسالة جديدة\n"
+                f"👤 {user.first_name or '-'}\n"
+                f"🆔 {user.id}\n"
+                f"🔗 @{user.username}" if user.username else
+                "📩 رسالة جديدة\n"
+                f"👤 {user.first_name or '-'}\n"
+                f"🆔 {user.id}"
+            ),
+        )
+        forwarded = await msg.forward(chat_id=OWNER_ID_INT)
+        save_relay(forwarded.message_id, user.id)
+        save_relay(header.message_id, user.id)
+    except TelegramError as exc:
+        logger.error("Failed forwarding user %s to owner: %s", user.id, exc)
+
+
+async def handle_owner_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update):
         return
 
-    students = data.get("students", {})
-    recipients = [
-        sid
-        for sid, profile in students.items()
-        if sid not in data.get("banned", []) and not profile.get("blocked", False)
-    ]
+    msg = update.effective_message
+    if not msg:
+        return
 
-    if not recipients:
-        await update.effective_message.reply_text(
-            "⚠️ لا يوجد مستخدمون نشطون في قاعدة البيانات حاليًا."
-        )
+    # Commands and #broadcast are handled earlier.
+    if msg.text and (msg.text.startswith("/") or msg.text.lower().startswith("#broadcast")):
+        return
+
+    if msg.reply_to_message:
+        target = relay_target(msg.reply_to_message.message_id)
+        if target:
+            try:
+                await msg.copy(chat_id=target)
+                try:
+                    await msg.set_reaction("👍")
+                except TelegramError:
+                    pass
+            except Forbidden:
+                mark_unreachable(target)
+                await msg.reply_text("❌ المستخدم حظر البوت أو لم يعد متاحًا.")
+            except TelegramError as exc:
+                await msg.reply_text(f"❌ فشل الإرسال: {exc}")
+            return
+
+    await msg.reply_text(
+        "ℹ️ للرد على طالب: اعمل Reply على الرسالة المحولة منه.\n"
+        "للبث: اعمل Reply على الرسالة المطلوبة واكتب /broadcast أو #broadcast."
+    )
+
+
+# =============================================================================
+# BROADCAST
+# =============================================================================
+
+def retry_seconds(exc: RetryAfter) -> float:
+    value = exc.retry_after
+    if hasattr(value, "total_seconds"):
+        return float(value.total_seconds())
+    return float(value)
+
+
+async def perform_broadcast(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    source_message=None,
+    text_message=None,
+):
+    if not await owner_only(update):
+        return
+
+    recipients = active_user_ids()
+    total = len(recipients)
+    if total == 0:
+        await update.effective_message.reply_text("⚠️ لا يوجد مستخدمون نشطون في قاعدة البيانات.")
         return
 
     status_msg = await update.effective_message.reply_text(
-        f"📢 بدأ البث إلى {len(recipients)} مستخدم..."
+        f"📢 بدء البث إلى {total} مستخدم..."
     )
 
-    success = blocked = failed = 0
-    failures = []
+    run_id = create_broadcast_run(total)
+    sent = 0
+    blocked = 0
+    failed = 0
 
-    for index, sid in enumerate(recipients, start=1):
-        result, error_text = await _send_with_retry(
-            context,
-            sid,
-            source_message=source_message,
-            text=text,
-            caption_override=caption_override,
-        )
+    for index, user_id in enumerate(recipients, start=1):
+        try:
+            if source_message is not None:
+                await source_message.copy(chat_id=user_id)
+            else:
+                await context.bot.send_message(chat_id=user_id, text=text_message)
 
-        if result == "success":
-            success += 1
-        elif result == "blocked":
+            sent += 1
+
+        except RetryAfter as exc:
+            await asyncio.sleep(retry_seconds(exc) + 0.5)
+            try:
+                if source_message is not None:
+                    await source_message.copy(chat_id=user_id)
+                else:
+                    await context.bot.send_message(chat_id=user_id, text=text_message)
+                sent += 1
+            except Forbidden:
+                blocked += 1
+                mark_unreachable(user_id)
+            except TelegramError as retry_exc:
+                failed += 1
+                logger.warning("Broadcast retry failed for %s: %s", user_id, retry_exc)
+
+        except Forbidden:
             blocked += 1
-            students.get(sid, {})["blocked"] = True
-        else:
-            failed += 1
-            if error_text and len(failures) < 10:
-                failures.append(f"{sid}: {error_text[:120]}")
+            mark_unreachable(user_id)
 
-        if index % 25 == 0 or index == len(recipients):
+        except BadRequest as exc:
+            failed += 1
+            logger.warning("Broadcast bad request for %s: %s", user_id, exc)
+
+        except TelegramError as exc:
+            failed += 1
+            logger.warning("Broadcast failed for %s: %s", user_id, exc)
+
+        if index % 25 == 0 or index == total:
             try:
                 await status_msg.edit_text(
-                    f"📢 جاري البث... {index}/{len(recipients)}\n"
-                    f"✅ {success} | 🚫 {blocked} | ❌ {failed}"
+                    "📢 Xavier Broadcast\n"
+                    f"التقدم: {index}/{total}\n"
+                    f"✅ تم: {sent}\n"
+                    f"🚫 غير متاح: {blocked}\n"
+                    f"⚠️ فشل: {failed}"
                 )
-            except Exception:
+            except TelegramError:
                 pass
 
         await asyncio.sleep(0.06)
 
-    save_data(data)
+    finish_broadcast_run(run_id, sent, blocked, failed)
 
-    report = (
-        "✅ Broadcast V2 انتهى\n"
-        f"👥 المستهدفون: {len(recipients)}\n"
-        f"✅ تم الإرسال: {success}\n"
-        f"🚫 حظروا البوت: {blocked}\n"
-        f"❌ فشل: {failed}"
+    await status_msg.edit_text(
+        "✅ انتهى البث\n\n"
+        f"👥 الإجمالي: {total}\n"
+        f"✅ تم الإرسال: {sent}\n"
+        f"🚫 حظر/غير متاح: {blocked}\n"
+        f"⚠️ فشل: {failed}"
     )
-    if failures:
-        report += "\n\nأول الأخطاء:\n" + "\n".join(failures)
 
-    await status_msg.edit_text(report)
 
-async def broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if await deny_if_not_admin(update):
-        return
-
-    source = update.message.reply_to_message
-    if source is None:
-        await update.message.reply_text(
-            "📌 اعمل Reply على الصورة/الرسالة المراد إرسالها ثم اكتب /broadcast"
-        )
-        return
-
-    await run_broadcast(update, context, data, source_message=source)
-
-async def hashtag_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if await deny_if_not_admin(update):
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
         return
 
     msg = update.effective_message
-
     if msg.reply_to_message:
-        await run_broadcast(update, context, data, source_message=msg.reply_to_message)
+        await perform_broadcast(update, context, source_message=msg.reply_to_message)
         return
 
-    raw = msg.caption if msg.caption is not None else msg.text
-    raw = raw or ""
-    clean = raw[len("#broadcast"):].lstrip(" \n:-")
-
-    if msg.photo or msg.video or msg.document or msg.animation or msg.audio:
-        await run_broadcast(
+    if context.args:
+        await perform_broadcast(
             update,
             context,
-            data,
-            source_message=msg,
-            caption_override=clean,
+            text_message=" ".join(context.args),
         )
         return
 
-    if clean:
-        await run_broadcast(update, context, data, text=clean)
-        return
-
     await msg.reply_text(
-        "📌 اعمل Reply على الصورة/الرسالة ثم اكتب #broadcast، "
-        "أو ابعت صورة Caption يبدأ بـ #broadcast."
+        "📢 للبث:\n"
+        "1) أرسل الصورة/الفيديو/الرسالة.\n"
+        "2) اعمل Reply عليها.\n"
+        "3) اكتب /broadcast أو #broadcast."
     )
 
-# ==============================================================================
-# 7. ROUTER + BOOTSTRAP
-# ==============================================================================
-async def main_router(update: Update, context: ContextTypes.DEFAULT_TYPE, data: dict):
-    if not update.message:
+
+async def hashtag_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
         return
 
-    uid = str(update.effective_user.id)
-    if uid in ADMIN_IDS:
-        await handle_admin_message(update, context, data)
+    msg = update.effective_message
+    if msg.reply_to_message:
+        await perform_broadcast(update, context, source_message=msg.reply_to_message)
+        return
+
+    raw = (msg.text or "").strip()
+    payload = raw[len("#broadcast"):].strip()
+    if payload:
+        await perform_broadcast(update, context, text_message=payload)
     else:
-        await handle_student_message(update, context, data)
+        await msg.reply_text("اعمل Reply على الرسالة المطلوبة ثم اكتب #broadcast.")
+
+
+# =============================================================================
+# OWNER TOOLS
+# =============================================================================
+
+async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    total, active, blocked, banned = stats()
+    await update.effective_message.reply_text(
+        "📊 Xavier Statistics\n\n"
+        f"👥 إجمالي المسجلين: {total}\n"
+        f"✅ نشط: {active}\n"
+        f"🚫 حظر البوت/غير متاح: {blocked}\n"
+        f"⛔ محظور إداريًا: {banned}"
+    )
+
+
+async def ban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /ban USER_ID")
+        return
+    target = int(context.args[0])
+    set_banned(target, True)
+    await update.effective_message.reply_text(f"⛔ تم حظر {target}.")
+
+
+async def unban_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await owner_only(update):
+        return
+    if not context.args or not context.args[0].isdigit():
+        await update.effective_message.reply_text("الاستخدام: /unban USER_ID")
+        return
+    target = int(context.args[0])
+    set_banned(target, False)
+    await update.effective_message.reply_text(f"✅ تم فك حظر {target}.")
+
+
+async def callbacks(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if not is_owner(update):
+        await query.answer("غير مصرح", show_alert=True)
+        return
+
+    if query.data == "stats":
+        total, active, blocked, banned = stats()
+        await query.message.reply_text(
+            f"👥 الإجمالي: {total}\n✅ نشط: {active}\n🚫 غير متاح: {blocked}\n⛔ محظور: {banned}"
+        )
+    elif query.data == "broadcast_help":
+        await query.message.reply_text(
+            "📢 أرسل الرسالة أو الصورة، ثم اعمل Reply عليها واكتب /broadcast أو #broadcast."
+        )
+
+
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    exc = context.error
+    if isinstance(exc, Conflict):
+        logger.critical(
+            "Telegram polling conflict: another process is using this bot token. Rotate the token immediately."
+        )
+        return
+    logger.exception("Unhandled Telegram error", exc_info=exc)
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
-    if not TOKEN:
-        raise RuntimeError("BOT_TOKEN environment variable is required.")
+    init_db()
+    start_web()
 
-    start_keep_alive()
-    bot_data = load_data()
-    telegram_app = Application.builder().token(TOKEN).build()
+    application = Application.builder().token(BOT_TOKEN).build()
 
-    telegram_app.add_handler(
-        CommandHandler("start", partial(start_command, data=bot_data))
-    )
-    telegram_app.add_handler(
-        CommandHandler("admin", partial(admin_panel, data=bot_data))
-    )
-    telegram_app.add_handler(
-        CommandHandler("ban", partial(ban_user, data=bot_data))
-    )
-    telegram_app.add_handler(
-        CommandHandler("unban", partial(unban_user, data=bot_data))
-    )
-    telegram_app.add_handler(
-        CommandHandler("broadcast", partial(broadcast, data=bot_data))
-    )
+    application.add_handler(CommandHandler("start", start_command))
+    application.add_handler(CommandHandler("admin", show_admin))
+    application.add_handler(CommandHandler("stats", stats_command))
+    application.add_handler(CommandHandler("broadcast", broadcast_command))
+    application.add_handler(CommandHandler("ban", ban_command))
+    application.add_handler(CommandHandler("unban", unban_command))
 
-    telegram_app.add_handler(
-        CallbackQueryHandler(partial(buttons_handler, data=bot_data))
-    )
-
-    hashtag_filter = (
-        (filters.TEXT & filters.Regex(r"(?i)^#broadcast(?:\s|$)"))
-        | filters.CaptionRegex(r"(?i)^#broadcast(?:\s|$)")
-    )
-    telegram_app.add_handler(
-        MessageHandler(
-            hashtag_filter,
-            partial(hashtag_broadcast, data=bot_data),
-        ),
+    # #broadcast must be handled before generic message routing.
+    application.add_handler(
+        MessageHandler(filters.Regex(r"(?i)^#broadcast(?:\\s|$)"), hashtag_broadcast),
         group=0,
     )
-    telegram_app.add_handler(
+
+    application.add_handler(CallbackQueryHandler(callbacks), group=0)
+
+    application.add_handler(
         MessageHandler(
-            filters.ALL & ~filters.COMMAND & ~hashtag_filter,
-            partial(main_router, data=bot_data),
+            filters.ALL & ~filters.COMMAND & ~filters.Regex(r"(?i)^#broadcast(?:\\s|$)"),
+            handle_owner_message,
         ),
         group=1,
     )
 
-    logger.info("Xavier Bot starting with Broadcast V2")
-    telegram_app.run_polling(drop_pending_updates=False)
+    application.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.COMMAND & ~filters.Regex(r"(?i)^#broadcast(?:\\s|$)"),
+            handle_student,
+        ),
+        group=2,
+    )
+
+    application.add_error_handler(error_handler)
+
+    logger.info("Xavier Bot starting with secure single-owner mode")
+    application.run_polling(drop_pending_updates=False)
+
 
 if __name__ == "__main__":
     main()
