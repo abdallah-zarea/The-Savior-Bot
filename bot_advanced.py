@@ -626,8 +626,8 @@ def main():
     )
 
     hashtag_filter = (
-        (filters.TEXT & filters.Regex(r"(?i)^#broadcast(?:\\s|$)"))
-        | filters.CaptionRegex(r"(?i)^#broadcast(?:\\s|$)")
+        (filters.TEXT & filters.Regex(r"(?i)^#broadcast(?:\s|$)"))
+        | filters.CaptionRegex(r"(?i)^#broadcast(?:\s|$)")
     )
     telegram_app.add_handler(
         MessageHandler(
