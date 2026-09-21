@@ -638,7 +638,7 @@ def main():
     )
     telegram_app.add_handler(
         MessageHandler(
-            filters.ALL & ~filters.COMMAND,
+            filters.ALL & ~filters.COMMAND & ~hashtag_filter,
             partial(main_router, data=bot_data),
         ),
         group=1,
